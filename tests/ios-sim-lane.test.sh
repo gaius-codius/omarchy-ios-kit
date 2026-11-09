@@ -108,6 +108,12 @@ check "a busy run asks for no forward (the holder's port would refuse it)" '! gr
 check "a second run is told it's busy, with the holder, and exits 75" '[ $code -eq 75 ] && [[ $busy == *"busy: the runs'"'"' simulator is held by kiwi since "*"carry on without the simulator"* ]]'
 check "the busy run holds nothing" '[[ $(lane 2 status) == *"doesn'"'"'t hold"* ]]'
 check "the second run's verbs are refused" '! lane 2 shot "$T/x.png" 2>/dev/null'
+: >"$LOG"
+lane 2 shot "$T/x.png" 2>/dev/null || true
+check "a run without the hold sends nothing to the Mac" '! grep -q "^ssh " "$LOG"'
+check "the gate refuses a wrong token while a hold is live" '! gate "shot wrongtoken" 2>/dev/null </dev/null'
+check "the gate refuses a key starting with a dot, with the holder's token" '! gate "upload $(cat "$T/lane1/token") .x" 2>/dev/null </dev/null'
+check "the gate refuses an upload into a key's parent through the holder's token" '! gate "upload $(cat "$T/lane1/token") .." 2>/dev/null </dev/null'
 
 # lane_as RUN ARGS...: ios-sim-lane in run RUN's unit, with the default hold folder.
 lane_as() {
@@ -129,6 +135,7 @@ check "another run's hold folder doesn't count as this run's" '[[ $(lane_as p-9-
 lane 1 axe tap --label "Needs you" >/dev/null
 check "axe goes to the runs' device only" 'grep -qx "axe tap --label Needs you --udid AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE" "$LOG"'
 check "axe with a device of its own is refused" '! lane 1 axe tap --udid 11111111-2222-3333-4444-555555555555 2>/dev/null'
+check "axe with -- is refused (it would make the gate's --udid an argument)" '! lane 1 axe tap -- 10 10 2>/dev/null'
 check "no axe call reached another device" '! grep -q "11111111-2222" <(grep "^axe" "$LOG")'
 lane 1 sim openurl "conspector-pair://127.0.0.1:18443/K7Q2" >/dev/null
 check "sim names the runs' device" 'grep -qx "xcrun simctl openurl AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE conspector-pair://127.0.0.1:18443/K7Q2" "$LOG"'
@@ -155,8 +162,13 @@ echo "dep" >"$dep/Package.swift"
 : >"$LOG"
 lane 1 run "$app" >/dev/null
 up="$MAC/ios-sim-run/runs/Conspector-gh-1"
+mkdir -p "$MAC/ios-sim-run/runs/Conspector-gh-2/dd"
+app2="$T/work/Conspector-gh-2"
+mkdir -p "$app2" && cp "$app/xtool.yml" "$app/Package.swift" "$app2/"
 check "run copies the run's checkout, without .build" '[ -f "$up/src/xtool.yml" ] && [ ! -e "$up/src/.build" ]'
 check "run copies a local package beside it, made relative" '[ -f "$up/deps/HotReload/Package.swift" ] && grep -q "\.\./deps/HotReload" "$up/src/Package.swift"'
+lane 1 run "$app2" >/dev/null
+check "a new app's upload removes the other apps' builds on the Mac" '[ ! -e "$up" ] && [ -d "$MAC/ios-sim-run/runs/Conspector-gh-2/src" ]'
 check "run installs and launches on the runs' device" 'grep -q "xcrun simctl install AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE" "$LOG" && grep -q "xcrun simctl launch AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE com.example.app" "$LOG"'
 
 # --- Letting go ---------------------------------------------------------------------------
@@ -204,6 +216,19 @@ echo ghost >"$MAC/ios-sim-run/runs/.lock/who"
 out=$(lane 3 take --label wren)
 check "a hold whose process is gone is taken over" '[[ $out == *holding* ]]'
 lane 3 release >/dev/null
+for _ in $(seq 50); do [ -d "$MAC/ios-sim-run/runs/.lock" ] || break; sleep 0.1; done
+
+# --- A pid from an earlier boot of the Mac ---------------------------------------------
+sleep 600 >/dev/null 2>&1 &
+alive=$!
+mkdir -p "$MAC/ios-sim-run/runs/.lock"
+echo "$alive" >"$MAC/ios-sim-run/runs/.lock/pid"
+echo "an earlier boot" >"$MAC/ios-sim-run/runs/.lock/boot"
+out=$(lane 6 take --label lark 2>&1) || true
+kill "$alive" 2>/dev/null || true
+check "a hold whose pid is alive but from an earlier boot is taken over" '[[ $out == *holding* ]]'
+lane 6 release >/dev/null
+for _ in $(seq 50); do [ -d "$MAC/ios-sim-run/runs/.lock" ] || break; sleep 0.1; done
 
 # --- The developer's key ----------------------------------------------------------------
 echo "dev key" >"$T/home/.ssh/id_ed25519"

@@ -71,6 +71,7 @@ Host simmac
   BatchMode yes
   ControlPath $STATE/cm
   ServerAliveInterval 15
+  ConnectTimeout 20
 EOF
 
 # gate VERB [WORDS...]: run a gate verb on the Mac; stdin goes to it.
@@ -172,7 +173,6 @@ run_app() {
         tar -C "$d" --exclude=./.build -cf - . | tar -C "$stage/deps/$name" -xf -
         sed -i "s#\"$d\"#\"../deps/$name\"#" "$stage/src/Package.swift"
     done < <(sed -n 's/.*\.package(path: *"\(\/[^"]*\)").*/\1/p' "$app_dir/Package.swift")
-    tok=$(token)
     echo "copying $key"
     tar -C "$stage" -cf - src deps | gate upload "$tok" "$key"
     gate build "$tok" "$key" </dev/null
@@ -180,22 +180,23 @@ run_app() {
 
 cmd=${1:-}
 [ $# -gt 0 ] && shift
+# The token, read before any verb is sent: a run that doesn't hold the simulator stops here.
+case $cmd in run | trust | shot | axe | type | sim) tok=$(token) ;; esac
 case $cmd in
     take) take "$@" ;;
     run) run_app "$@" ;;
-    trust) [ $# -eq 1 ] || die "usage: ios-sim-lane trust CA.pem" 2; gate trust "$(token)" <"$1" ;;
+    trust) [ $# -eq 1 ] || die "usage: ios-sim-lane trust CA.pem" 2; gate trust "$tok" <"$1" ;;
     shot)
         [ $# -eq 1 ] || die "usage: ios-sim-lane shot FILE" 2
-        gate shot "$(token)" </dev/null >"$1.part" && mv "$1.part" "$1" && echo "$1" ;;
-    axe) args "$@" | gate axe "$(token)" ;;
+        gate shot "$tok" </dev/null >"$1.part" && mv "$1.part" "$1" && echo "$1" ;;
+    axe) args "$@" | gate axe "$tok" ;;
     type)
         [ $# -eq 1 ] || die "usage: ios-sim-lane type TEXT" 2
-        tok=$(token)
         for ((i = 0; i < ${#1}; i++)); do
             args type "${1:i:1}" | gate axe "$tok" >/dev/null
             sleep 0.15
         done ;;
-    sim) args "$@" | gate sim "$(token)" ;;
+    sim) args "$@" | gate sim "$tok" ;;
     release) release_quiet; echo "let the runs' simulator go" ;;
     status) if holding; then echo "this run holds the runs' simulator"; else echo "this run doesn't hold the simulator"; fi ;;
     -h | --help | "") sed -n 2,28p "$0"; [ -n "$cmd" ] ;;

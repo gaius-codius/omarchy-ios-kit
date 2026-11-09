@@ -598,9 +598,15 @@ Once, by you (an agent never makes or handles the key):
    restrict,port-forwarding,permitlisten="127.0.0.1:18443",permitopen="127.0.0.1:9",command="/Users/<user>/ios-sim-run/ios-sim-gate" ssh-ed25519 AAAA... runs-simulator
    ```
 
-   `restrict` turns off the shell, agent and X11 forwarding, and a terminal. `port-forwarding`
-   lets the run forward back to its own machine, on that one port. `permitopen` names a port
-   nothing listens on, so the run can't forward its way onto your network from the Mac.
+   `restrict` turns off agent and X11 forwarding and a terminal, and the forced command
+   replaces the shell. `port-forwarding` lets the run forward back to its own machine on that
+   one port; `permitopen` names a port nothing listens on, so `-L` reaches nothing. It also
+   turns Unix socket forwarding back on, which these options don't narrow.
+
+   What this guards against is a run's mistake: acting on your simulator, keeping a pairing,
+   using your key. It is not a wall against a run that sets out to break out. The run's own
+   branch is built and launched on the Mac as your Mac user, and a Swift package can run code
+   while it builds.
 5. Check it: `ios-sim-lane take --label check && ios-sim-lane release`.
 
 Settings for the gate go in `~/ios-sim-run/gate.conf` on the Mac (`IOS_SIM_GATE_DEVICE_TYPE`,

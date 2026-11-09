@@ -80,10 +80,13 @@ check_token() {
     holder_alive || die "refused: the hold has ended"
 }
 
+# boot_id names this boot of the Mac: a pid from an earlier boot is someone else's now.
+boot_id() { sysctl -n kern.boottime 2>/dev/null || cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown; }
+
 holder_alive() {
     local pid
     pid=$(cat "$LOCK/pid" 2>/dev/null) || return 1
-    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+    [ "$(cat "$LOCK/boot" 2>/dev/null)" = "$(boot_id)" ] && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
 }
 
 check_key() {
@@ -109,6 +112,7 @@ take() {
         echo "busy: the runs' simulator is held by $(cat "$LOCK/who" 2>/dev/null || echo someone) since $(cat "$LOCK/since" 2>/dev/null || echo "a moment ago")"
         exit $EX_BUSY
     fi
+    boot_id >"$LOCK/boot"
     echo $$ >"$LOCK/pid"
 }
 
@@ -147,6 +151,9 @@ upload() {
     local key=$1 dir
     check_key "$key"
     dir="$ROOT/$key"
+    # One app's build is kept on the Mac at a time: the other keys' folders (their
+    # DerivedData is gigabytes) go.
+    find "$ROOT" -mindepth 1 -maxdepth 1 -type d ! -name '.*' ! -name "$key" -exec rm -rf {} +
     rm -rf "$dir/src" "$dir/deps"
     mkdir -p "$dir"
     # bsdtar refuses absolute paths and .. by default.
@@ -189,7 +196,7 @@ EOF
         -derivedDataPath ../dd -configuration Debug \
         COMPILATION_CACHE_ENABLE_CACHING=NO COMPILATION_CACHE_CAS_PATH="$HOME/ios-sim-run/.cas" \
         build >"$log" 2>&1); then
-        grep -E "error:" "$log" | head -40 || tail -40 "$log"
+        if grep -q "error:" "$log"; then grep "error:" "$log" | head -40 || true; else tail -40 "$log"; fi
         die "build failed; the log is on the Mac: $log"
     fi
     products="$dir/dd/Build/Products/Debug-iphonesimulator"
@@ -237,7 +244,8 @@ axe_verb() {
     read_args
     [ ${#ARGS[@]} -gt 0 ] || die "axe needs arguments (tap, type, swipe, describe-ui, ...)"
     for a in "${ARGS[@]}"; do
-        case $a in --udid | --udid=*) die "refused: the gate names the device" ;; esac
+        # "--" would make the gate's own --udid a plain argument.
+        case $a in --udid | --udid=* | --) die "refused: the gate names the device" ;; esac
     done
     axe "${ARGS[@]}" --udid "$u"
 }

@@ -97,6 +97,24 @@ args() {
     done
 }
 
+# axe_call ARGS...: an AXe verb on the simulator. Just after the device is erased, AXe
+# can't open its automation session for a while ("Timed out creating the simulator
+# remote automation session"); that error alone is retried, for up to a minute.
+axe_call() {
+    local a i
+    a=$(args "$@") || exit 1
+    for ((i = 0; i < 12; i++)); do
+        if gate axe "$tok" <<<"$a" >"$STATE/axe.out" 2>"$STATE/axe.err"; then
+            cat "$STATE/axe.out"
+            return 0
+        fi
+        grep -q 'remote automation session' "$STATE/axe.err" || break
+        sleep "${IOS_SIM_LANE_AXE_WAIT:-5}"
+    done
+    cat "$STATE/axe.err" >&2
+    return 1
+}
+
 take() {
     local label="a run" port=18443 waited=0 line
     while [ $# -gt 0 ]; do
@@ -189,11 +207,11 @@ case $cmd in
     shot)
         [ $# -eq 1 ] || die "usage: ios-sim-lane shot FILE" 2
         gate shot "$tok" </dev/null >"$1.part" && mv "$1.part" "$1" && echo "$1" ;;
-    axe) args "$@" | gate axe "$tok" ;;
+    axe) axe_call "$@" ;;
     type)
         [ $# -eq 1 ] || die "usage: ios-sim-lane type TEXT" 2
         for ((i = 0; i < ${#1}; i++)); do
-            args type "${1:i:1}" | gate axe "$tok" >/dev/null
+            axe_call type "${1:i:1}" >/dev/null
             sleep 0.15
         done ;;
     sim) args "$@" | gate sim "$tok" ;;

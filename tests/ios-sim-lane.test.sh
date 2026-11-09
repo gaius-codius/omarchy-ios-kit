@@ -38,6 +38,15 @@ EOF
 cat >"$STUB/axe" <<'EOF'
 #!/usr/bin/env bash
 echo "axe $*" >>"$LOG"
+# $MAC/axe-cold holds how many calls fail as AXe does just after an erase; $MAC/axe-broken
+# makes every call fail with another error.
+[ -f "$MAC/axe-broken" ] && { echo "Error: no such element" >&2; exit 1; }
+n=$(cat "$MAC/axe-cold" 2>/dev/null || echo 0)
+if [ "$n" -gt 0 ]; then
+    echo $((n - 1)) >"$MAC/axe-cold"
+    echo "Error: Timed out creating the simulator remote automation session" >&2
+    exit 1
+fi
 EOF
 cat >"$STUB/xcodebuild" <<'EOF'
 #!/usr/bin/env bash
@@ -141,6 +150,11 @@ lane 1 sim openurl "conspector-pair://127.0.0.1:18443/K7Q2" >/dev/null
 check "sim names the runs' device" 'grep -qx "xcrun simctl openurl AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE conspector-pair://127.0.0.1:18443/K7Q2" "$LOG"'
 check "sim refuses a verb that isn't listed (spawn)" '! lane 1 sim spawn booted ls 2>/dev/null'
 check "sim refuses keychain (trust is the only way in)" '! lane 1 sim keychain booted reset 2>/dev/null'
+echo 3 >"$MAC/axe-cold"; : >"$LOG"
+check "axe waits out the session that isn't ready just after an erase" 'IOS_SIM_LANE_AXE_WAIT=0 lane 1 axe describe-ui >/dev/null && [ "$(grep -c "^axe describe-ui" "$LOG")" -eq 4 ]'
+touch "$MAC/axe-broken"; : >"$LOG"
+check "axe doesn't retry any other error, and says it" '! IOS_SIM_LANE_AXE_WAIT=0 lane 1 axe tap --label Gone 2>"$T/axe.err" && [ "$(grep -c "^axe tap" "$LOG")" -eq 1 ] && grep -q "no such element" "$T/axe.err"'
+rm -f "$MAC/axe-broken" "$MAC/axe-cold"
 : >"$LOG"
 lane 1 type ab >/dev/null
 check "type sends one character at a time" '[ "$(grep -c "^axe type . --udid" "$LOG")" -eq 2 ]'

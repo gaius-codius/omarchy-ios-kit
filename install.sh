@@ -87,7 +87,7 @@ echo "   saved"
 # --- 3. The kit's own files -------------------------------------------------
 say "Installing the tools to $BIN and $SHARE"
 mkdir -p "$BIN" "$SHARE"
-for f in ios-run new-ios-app ios-toolchain-upgrade; do
+for f in ios-run new-ios-app ios-toolchain-upgrade ios-sim-run; do
   install -m 755 "$KIT/bin/$f" "$BIN/$f"
 done
 ln -sfn ios-run "$BIN/ios-run-dev"
@@ -101,7 +101,7 @@ done
 mkdir -p "$SHARE/docs"
 install -m 644 "$KIT/README.md" "$SHARE/docs/README.md"
 install -m 644 "$KIT/docs/HOW-IT-WORKS.md" "$SHARE/docs/HOW-IT-WORKS.md"
-echo "   ios-run, ios-run-dev, new-ios-app, ios-toolchain-upgrade; hot reload, templates, docs"
+echo "   ios-run, ios-run-dev, new-ios-app, ios-toolchain-upgrade, ios-sim-run; hot reload, templates, docs"
 case ":$PATH:" in *":$BIN:"*) ;; *) echo "   note: add $BIN to your PATH" ;; esac
 
 # --- 4. Optional: system fixes (sudo) --------------------------------------

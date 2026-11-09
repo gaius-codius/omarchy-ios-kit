@@ -38,7 +38,7 @@ you don't have to find them again.
 9. [Coding agents (AGENTS.md)](#9-coding-agents-agentsmd)
 10. [Keeping it working](#10-keeping-it-working)
 11. [Troubleshooting](#11-troubleshooting)
-12. [Intel Macs and other machines](#12-intel-macs-and-other-machines)
+12. [Intel Macs, other machines and the Simulator](#12-intel-macs-and-other-machines)
 13. [Uninstall](#13-uninstall)
 14. [Credits and license](#14-credits-and-license)
 
@@ -521,6 +521,45 @@ different is hardware, and **untested by us**:
 If you try it on another machine, the quickest end-to-end check is:
 `new-ios-app Check`, F6 (runs), F5 (stops at a breakpoint), then edit a
 `Text` and save (hot reload).
+
+### 12.1 The iOS Simulator on a Mac (`ios-sim-run`)
+
+Linux has no Simulator, but a Mac with Xcode on your network (Tailscale works) can run
+your app in one, driven from here over ssh. Use it to check a branch without the phone. Coding
+agents can use it too: they can tap, type and take screenshots on their own.
+
+Once:
+1. On the Mac: Xcode with an iOS Simulator runtime, ssh login from this machine, and
+   [AXe](https://github.com/cameroncooke/AXe) for taps: `brew install cameroncooke/axe/axe`.
+2. Here: add `SIM_HOST="user@mac"` to `~/.config/ios-run/config` (and `SIM_DEVICE` to change
+   the default simulator, "iPhone 18 Pro").
+
+Daily, in the app folder or a worktree of it:
+
+| Do | Command |
+|---|---|
+| Copy, build, install and open the app | `ios-sim-run` (`--device "iPhone 17"`, `--release`) |
+| The same, plus a screenshot | `ios-sim-run --shot shot.png` |
+| Screenshot what's on screen now | `ios-sim-run shot shot.png` |
+| Tap, type, read the screen | `ios-sim-run axe tap --label Settings`, `ios-sim-run axe type abc`, `ios-sim-run axe describe-ui` |
+| Anything `simctl` does | `ios-sim-run sim ui booted appearance dark`, `ios-sim-run sim push booted <bundle id> push.json` |
+
+How it works: the app folder is copied to `~/ios-sim-run/<folder>/` on the Mac, with its local
+path packages (HotReload) beside it. A wrapper package, like xtool's, makes the app library an
+executable. `xcodebuild` builds it for the Simulator, and the script wraps it in an `.app` with
+xtool's Info.plist keys. A worktree also gets the git-ignored files under `Sources/` from
+its main checkout, unless it has its own. A build takes about 15 to 30 seconds.
+
+Known traps:
+- **The app is signed ad hoc without its entitlements.** Signed with them, `aps-environment`
+  fails the launch (`OS_REASON_EXEC`). Push registration and other features that need an
+  entitlement don't work in the Simulator for now.
+- **Xcode's compilation cache preference can name a drive that isn't mounted.** That fails the
+  build ("You don't have permission to save the file…"). The script gives the cache its own path.
+- **AXe can drop characters typed fast** into fields that move focus as you type (a code
+  entered box by box). Type one character at a time with a short pause.
+- **Homebrew isn't on a non-interactive ssh PATH** on a Mac. The script adds `/opt/homebrew/bin`.
+- **Hot reload doesn't work here.** Run `ios-sim-run` again after each change.
 
 ---
 

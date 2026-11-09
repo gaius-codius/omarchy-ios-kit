@@ -561,6 +561,76 @@ Known traps:
 - **Homebrew isn't on a non-interactive ssh PATH** on a Mac. The script adds `/opt/homebrew/bin`.
 - **Hot reload doesn't work here.** Run `ios-sim-run` again after each change.
 
+### 12.2 Runs and the simulator (`ios-sim-lane`)
+
+A coding agent's unattended run can drive a simulator too, with `ios-sim-lane` in place of
+`ios-sim-run`. It is built so that a run can't act as you:
+
+- **Its own key.** The run logs in with a key made for runs alone. On the Mac, that key's only
+  command is `ios-sim-gate`, which takes a short list of verbs and no shell. Your own key in
+  `~/.ssh` is refused, and a run's sandbox can't read that folder anyway.
+- **Its own simulator.** The gate drives one device, "csp runs", and never another, so your
+  simulators and their pairings stay out of reach. The device is erased when a run takes it
+  and when the run lets it go, so no pairing survives from one holder to the next.
+- **One run at a time.** A second run is told `busy: ... held by <run> since <time>`, exits 75
+  and carries on without the simulator. The hold ends when the run lets it go or when its
+  process ends, because its ssh connection then closes. A hold whose process is gone, after a
+  reboot say, is taken over.
+- **No system files.** `ios-sim-lane` writes its own ssh config and reads no system or user
+  config. Inside a run's sandbox, `/etc/ssh` belongs to nobody, and ssh refuses it.
+- **The app talks to a scratch server.** The run forwards the Mac's `127.0.0.1:18443` to its
+  own machine, where a scratch server answers. For conspector that is `csp scratch`, with
+  synthetic items, so the app is never paired with the real `csp`.
+
+Once, by you (an agent never makes or handles the key):
+
+1. Make the runs' key, without a passphrase, since a run can't type one:
+   `ssh-keygen -t ed25519 -N '' -C runs-simulator -f ~/.config/ios-run/runs-key`.
+2. Pin the Mac's host key for runs. Your own `known_hosts` is out of their reach.
+   `ssh-keygen -F <mac>` prints the line you already trust; save it with
+   `ssh-keygen -F <mac> | grep -v '^#' > ~/.config/ios-run/runs-known_hosts`.
+3. Install the gate on the Mac: `scp mac/ios-sim-gate <user>@<mac>:ios-sim-run/ios-sim-gate`, then
+   `ssh <user>@<mac> chmod 755 ios-sim-run/ios-sim-gate`.
+4. On the Mac, add one line to `~/.ssh/authorized_keys`, with your Mac user's home and the
+   contents of `~/.config/ios-run/runs-key.pub`:
+
+   ```
+   restrict,port-forwarding,permitlisten="127.0.0.1:18443",permitopen="127.0.0.1:9",command="/Users/<user>/ios-sim-run/ios-sim-gate" ssh-ed25519 AAAA... runs-simulator
+   ```
+
+   `restrict` turns off the shell, agent and X11 forwarding, and a terminal. `port-forwarding`
+   lets the run forward back to its own machine, on that one port. `permitopen` names a port
+   nothing listens on, so the run can't forward its way onto your network from the Mac.
+5. Check it: `ios-sim-lane take --label check && ios-sim-lane release`.
+
+Settings for the gate go in `~/ios-sim-run/gate.conf` on the Mac (`IOS_SIM_GATE_DEVICE_TYPE`,
+default "iPhone 18 Pro"). The gate reads nothing from the run's environment.
+
+A run, in the app folder or a worktree of it:
+
+| Do | Command |
+|---|---|
+| Take the simulator (exit 75: busy, carry on without it) | `ios-sim-lane take --label <run>` |
+| Copy, build, install and open the app | `ios-sim-lane run` |
+| Trust the scratch server's certificate | `ios-sim-lane trust <ca.pem>` |
+| Type into a field, one character at a time | `ios-sim-lane type K7Q2M9XD` |
+| Tap, swipe, read the screen | `ios-sim-lane axe tap --label "Needs you"`, `ios-sim-lane axe describe-ui` |
+| Open a link, set the look | `ios-sim-lane sim openurl <url>`, `ios-sim-lane sim ui appearance dark` |
+| Screenshot | `ios-sim-lane shot shot.png` |
+| Let it go | `ios-sim-lane release` |
+
+Traps:
+- **Type one character at a time.** AXe drops characters typed fast into a field that moves
+  focus as you type. `ios-sim-lane type` does this for you.
+- **Uninstalling the app doesn't clear its keychain items.** A pairing outlives a reinstall.
+  The gate erases the whole device instead, when a run takes it and when it lets it go.
+- **`simctl pbcopy` gets an empty stdin over ssh.** Type the text instead of pasting it.
+- **Nothing is copied from your main checkout.** `ios-sim-run` fills in a worktree's
+  git-ignored files under `Sources/` from the main checkout, which could build your real
+  server's address into the app. `ios-sim-lane` builds the run's checkout as it is.
+- **Release before the turn ends.** A hold lasts as long as the run's process. When the
+  process ends, the hold ends with it.
+
 ---
 
 ## 13. Uninstall

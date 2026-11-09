@@ -136,6 +136,13 @@ check "the next run takes it once it is free" '[[ $out == *holding* ]]'
 lane 2 release >/dev/null
 for _ in $(seq 50); do [ -d "$MAC/ios-sim-run/runs/.lock" ] || break; sleep 0.1; done
 
+# --- A hold that ends because its stdin closes (the run's ssh ended) ----------------------
+: >"$LOG"
+printf 'kiwi\n' | gate hold >"$T/hold-eof.out" 2>"$T/hold-eof.err" || true
+check "a hold whose stdin closes prints its token, then ends" 'grep -q "^token " "$T/hold-eof.out"'
+check "it erases the runs' device on the way out" '[ "$(grep -c "xcrun simctl erase AAAAAAAA" "$LOG")" -ge 2 ]'
+check "and frees the lock" '[ ! -d "$MAC/ios-sim-run/runs/.lock" ]'
+
 # --- A hold whose process died ------------------------------------------------------------
 mkdir -p "$MAC/ios-sim-run/runs/.lock"
 echo 999999 >"$MAC/ios-sim-run/runs/.lock/pid"

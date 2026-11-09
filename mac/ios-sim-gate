@@ -112,15 +112,19 @@ release() {
     rm -rf "$LOCK"
 }
 
+# HOLD_UDID is global: the EXIT trap runs after hold has returned, when its locals are gone.
+HOLD_UDID=""
 hold() {
-    local label u tok
+    local label tok
     IFS= read -r label || true
     case $label in "" | *[!A-Za-z0-9._\ -]*) label="a run" ;; esac
     take
+    trap 'rm -rf "$LOCK"' EXIT
     printf '%s\n' "$label" >"$LOCK/who"
     date -u +%Y-%m-%dT%H:%M:%SZ >"$LOCK/since"
-    u=$(udid)
-    trap 'release "$u"' EXIT
+    HOLD_UDID=$(udid)
+    trap 'release "$HOLD_UDID"' EXIT
+    local u=$HOLD_UDID
     trap 'exit 0' HUP INT TERM PIPE
     wipe "$u" >/dev/null
     xcrun simctl boot "$u" >/dev/null 2>&1 || true

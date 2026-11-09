@@ -584,14 +584,15 @@ A coding agent's unattended run can drive a simulator too, with `ios-sim-lane` i
 
 Once, by you (an agent never makes or handles the key):
 
-1. Make the runs' key, without a passphrase, since a run can't type one:
+1. Install the kit again (`./install.sh`), so `ios-sim-lane` is on your PATH.
+2. Make the runs' key, without a passphrase, since a run can't type one:
    `ssh-keygen -t ed25519 -N '' -C runs-simulator -f ~/.config/ios-run/runs-key`.
-2. Pin the Mac's host key for runs. Your own `known_hosts` is out of their reach.
+3. Pin the Mac's host key for runs. Your own `known_hosts` is out of their reach.
    `ssh-keygen -F <mac>` prints the line you already trust; save it with
    `ssh-keygen -F <mac> | grep -v '^#' > ~/.config/ios-run/runs-known_hosts`.
-3. Install the gate on the Mac: `scp mac/ios-sim-gate <user>@<mac>:ios-sim-run/ios-sim-gate`, then
+4. Install the gate on the Mac: `scp mac/ios-sim-gate <user>@<mac>:ios-sim-run/ios-sim-gate`, then
    `ssh <user>@<mac> chmod 755 ios-sim-run/ios-sim-gate`.
-4. On the Mac, add one line to `~/.ssh/authorized_keys`, with your Mac user's home and the
+5. On the Mac, add one line to `~/.ssh/authorized_keys`, with your Mac user's home and the
    contents of `~/.config/ios-run/runs-key.pub`:
 
    ```
@@ -607,7 +608,7 @@ Once, by you (an agent never makes or handles the key):
    using your key. It is not a wall against a run that sets out to break out. The run's own
    branch is built and launched on the Mac as your Mac user, and a Swift package can run code
    while it builds.
-5. Check it: `ios-sim-lane take --label check && ios-sim-lane release`.
+6. Check it: `ios-sim-lane take --label check && ios-sim-lane release`.
 
 Settings for the gate go in `~/ios-sim-run/gate.conf` on the Mac (`IOS_SIM_GATE_DEVICE_TYPE`,
 default "iPhone 18 Pro"). The gate reads nothing from the run's environment.

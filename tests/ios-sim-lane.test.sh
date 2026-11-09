@@ -45,12 +45,27 @@ echo "xcodebuild $*" >>"$LOG"
 mkdir -p ../dd/Build/Products/Debug-iphonesimulator && echo bin >../dd/Build/Products/Debug-iphonesimulator/App
 EOF
 for tool in plutil codesign; do printf '#!/usr/bin/env bash\necho "%s $*" >>"$LOG"\n' "$tool" >"$STUB/$tool"; done
-# The fake ssh: options, the host, then the command line, run as the forced command.
+# The fake ssh: options, the host, then the command line, run as the forced command. A
+# control command (-O forward) is logged with its -R and fails while $T/forward-fails exists.
 cat >"$STUB/ssh" <<EOF
 #!/usr/bin/env bash
-while [ \$# -gt 1 ]; do
-    case \$1 in -F|-o|-R) shift 2 ;; -*) shift ;; simmac) shift; break ;; *) shift ;; esac
+ctl="" fwd=""
+while [ \$# -gt 0 ]; do
+    case \$1 in
+        -O) ctl=\$2; shift 2 ;;
+        -R) fwd=\$2; shift 2 ;;
+        -F|-o) shift 2 ;;
+        -*) shift ;;
+        simmac) shift; break ;;
+        *) shift ;;
+    esac
 done
+if [ -n "\$ctl" ]; then
+    echo "ssh -O \$ctl \$fwd" >>"\$LOG"
+    [ ! -e "$T/forward-fails" ] || { echo "remote port forwarding failed for listen port" >&2; exit 255; }
+    exit 0
+fi
+[ -z "\$fwd" ] || echo "ssh asked to forward \$fwd" >>"\$LOG"
 echo "ssh \$*" >>"\$LOG"
 SSH_ORIGINAL_COMMAND="\$*" HOME="$MAC" exec bash "$KIT/mac/ios-sim-gate"
 EOF
@@ -80,15 +95,34 @@ check "the gate refuses a key with a slash" '! gate "upload t ../x" 2>/dev/null 
 
 # --- One run takes it, another is told it's busy ----------------------------------------
 out=$(lane 1 take --label kiwi)
+check "the hold's own ssh asks for no forward; the forward comes after it" '! grep -q "^ssh asked to forward" "$LOG" && grep -q "^ssh -O forward 127.0.0.1:18443:127.0.0.1:18443" "$LOG"'
 check "a run takes the runs' simulator" '[[ $out == *"holding the runs'"'"' simulator (AAAAAAAA-"* ]]'
 check "taking it erases the runs' device before the run sees it" 'grep -q "xcrun simctl erase AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE" "$LOG"'
+: >"$LOG"
 set +e
 busy=$(lane 2 take --label sol 2>&1)
 code=$?
 set -e
+check "a busy run asks for no forward (the holder's port would refuse it)" '! grep -q "forward" "$LOG"'
+
 check "a second run is told it's busy, with the holder, and exits 75" '[ $code -eq 75 ] && [[ $busy == *"busy: the runs'"'"' simulator is held by kiwi since "*"carry on without the simulator"* ]]'
 check "the busy run holds nothing" '[[ $(lane 2 status) == *"doesn'"'"'t hold"* ]]'
 check "the second run's verbs are refused" '! lane 2 shot "$T/x.png" 2>/dev/null'
+
+# lane_as RUN ARGS...: ios-sim-lane in run RUN's unit, with the default hold folder.
+lane_as() {
+    local run=$1
+    shift
+    HOME="$T/home" XDG_CONFIG_HOME="$T/home/.config" XDG_RUNTIME_DIR="$T/runtime" SIM_HOST=me@mac \
+        IOS_SIM_LANE_SSH="$STUB/ssh" CSP_RUN="$run" INVOCATION_ID="inv-$run" bash "$KIT/bin/ios-sim-lane" "$@"
+}
+mkdir -p "$T/runtime"
+set +e
+busy=$(lane_as p-9-1 take --label wren 2>&1)
+code=$?
+set -e
+check "runs sharing a runtime folder get their own hold folders, so the second is busy" '[ $code -eq 75 ] && [ -d "$T/runtime/ios-sim-lane-p-9-1" ]'
+check "another run's hold folder doesn't count as this run's" '[[ $(lane_as p-9-2 status) == *"doesn'"'"'t hold"* ]]'
 
 # --- What the holder may do ---------------------------------------------------------------
 : >"$LOG"
@@ -142,6 +176,26 @@ printf 'kiwi\n' | gate hold >"$T/hold-eof.out" 2>"$T/hold-eof.err" || true
 check "a hold whose stdin closes prints its token, then ends" 'grep -q "^token " "$T/hold-eof.out"'
 check "it erases the runs' device on the way out" '[ "$(grep -c "xcrun simctl erase AAAAAAAA" "$LOG")" -ge 2 ]'
 check "and frees the lock" '[ ! -d "$MAC/ios-sim-run/runs/.lock" ]'
+
+# --- A forward that fails lets the simulator go ---------------------------------------
+touch "$T/forward-fails"
+set +e
+err=$(lane 5 take --label owl 2>&1)
+code=$?
+set -e
+rm -f "$T/forward-fails"
+for _ in $(seq 50); do [ -d "$MAC/ios-sim-run/runs/.lock" ] || break; sleep 0.1; done
+check "a forward that fails ends the take, says why, and lets the simulator go" '[ $code -eq 1 ] && [[ $err == *"couldn'"'"'t be forwarded back"* ]] && [ ! -d "$MAC/ios-sim-run/runs/.lock" ]'
+
+# --- Breaking a stale hold is serialised -------------------------------------------------
+mkdir -p "$MAC/ios-sim-run/runs/.lock" "$MAC/ios-sim-run/runs/.break"
+echo 999999 >"$MAC/ios-sim-run/runs/.lock/pid"
+set +e
+printf 'jay\n' | gate hold >"$T/break.out" 2>&1
+code=$?
+set -e
+check "while another taker is breaking a stale hold, a taker is told busy and breaks nothing" '[ $code -eq 75 ] && [ "$(cat "$MAC/ios-sim-run/runs/.lock/pid")" = 999999 ]'
+rmdir "$MAC/ios-sim-run/runs/.break"
 
 # --- A hold whose process died ------------------------------------------------------------
 mkdir -p "$MAC/ios-sim-run/runs/.lock"

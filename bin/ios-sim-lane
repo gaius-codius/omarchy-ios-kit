@@ -24,7 +24,8 @@
 #   IOS_SIM_LANE_KEY         the runs' key (default ~/.config/ios-run/runs-key); never a
 #                            key in ~/.ssh
 #   IOS_SIM_LANE_KNOWN_HOSTS the Mac's host key (default ~/.config/ios-run/runs-known_hosts)
-#   IOS_SIM_LANE_DIR         this run's hold (default $XDG_RUNTIME_DIR or $TMPDIR, ios-sim-lane)
+#   IOS_SIM_LANE_DIR         this run's hold (default ios-sim-lane-<run> in $XDG_RUNTIME_DIR or
+#                            $TMPDIR, <run> being $CSP_RUN, else the unit's $INVOCATION_ID)
 # ssh reads no system or user ssh config: inside a run's unit those files belong to nobody,
 # and ssh refuses them.
 set -euo pipefail
@@ -35,7 +36,13 @@ IOS_RUN_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/ios-run/config"
 : "${SIM_HOST:?set SIM_HOST=user@host (the Mac) in $IOS_RUN_CONFIG}"
 KEY=${IOS_SIM_LANE_KEY:-${XDG_CONFIG_HOME:-$HOME/.config}/ios-run/runs-key}
 KNOWN=${IOS_SIM_LANE_KNOWN_HOSTS:-${XDG_CONFIG_HOME:-$HOME/.config}/ios-run/runs-known_hosts}
-STATE=${IOS_SIM_LANE_DIR:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/ios-sim-lane}
+# Each run has its own hold folder: runs share the runtime folder, and each has its own
+# process ids (PrivatePIDs), so one run's pid means nothing in another's.
+RUN_ID=${CSP_RUN:-${INVOCATION_ID:-$(id -u)}}
+RUN_ID=$(printf '%s' "$RUN_ID" | tr -c 'A-Za-z0-9._-' '_')
+STATE=${IOS_SIM_LANE_DIR:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/ios-sim-lane-$RUN_ID}
+# The unit's invocation: a pid recorded in an earlier turn's unit is another process now.
+INVOCATION=${INVOCATION_ID:-none}
 SSH=${IOS_SIM_LANE_SSH:-ssh}
 EX_BUSY=75
 
@@ -77,7 +84,7 @@ token() {
 holding() {
     local pid
     pid=$(cat "$STATE/hold.pid" 2>/dev/null) || return 1
-    kill -0 "$pid" 2>/dev/null
+    [ "$(cat "$STATE/hold.invocation" 2>/dev/null)" = "$INVOCATION" ] && kill -0 "$pid" 2>/dev/null
 }
 
 # args ARGS...: one per line on stdout, for a verb that reads its arguments on stdin.
@@ -102,15 +109,21 @@ take() {
     if holding; then echo "this run holds the simulator already"; return 0; fi
     rm -f "$STATE/hold.out" "$STATE/token" "$STATE/cm"
     # The hold is the ssh, leading a process group of its own: release stops the group,
-    # and so does the end of the run's process. Its stdin stays open while it lives.
+    # and so does the end of the run's process. Its stdin stays open while it lives. The
+    # port is forwarded only once the gate has given the hold, so a busy simulator is told
+    # as busy, not as a port already taken.
     setsid bash -c '
-        exec "$2" -F "$3" -o ControlMaster=yes -o ExitOnForwardFailure=yes \
-            -R "127.0.0.1:$4:127.0.0.1:$4" simmac hold < <(printf "%s\n" "$1"; exec sleep 2147483647)
-    ' _ "$label" "$SSH" "$CFG" "$port" >"$STATE/hold.out" 2>"$STATE/hold.err" </dev/null &
+        exec "$2" -F "$3" -o ControlMaster=yes simmac hold < <(printf "%s\n" "$1"; exec sleep 2147483647)
+    ' _ "$label" "$SSH" "$CFG" >"$STATE/hold.out" 2>"$STATE/hold.err" </dev/null &
     echo $! >"$STATE/hold.pid"
+    printf '%s\n' "$INVOCATION" >"$STATE/hold.invocation"
     while :; do
         if line=$(grep -m1 '^token ' "$STATE/hold.out" 2>/dev/null); then
             printf '%s\n' "${line#token }" >"$STATE/token"
+            if ! "$SSH" -F "$CFG" -O forward -R "127.0.0.1:$port:127.0.0.1:$port" simmac 2>"$STATE/forward.err"; then
+                release_quiet
+                die "the Mac's 127.0.0.1:$port couldn't be forwarded back: $(tr '\n' ' ' <"$STATE/forward.err")"
+            fi
             echo "holding the runs' simulator ($(sed -n 's/^udid //p' "$STATE/hold.out")); the Mac's 127.0.0.1:$port reaches this machine's"
             return 0
         fi
@@ -137,7 +150,7 @@ release_quiet() {
     pid=$(cat "$STATE/hold.pid" 2>/dev/null) || pid=""
     # The hold's process group, by its leader's id.
     [ -n "$pid" ] && kill -- "-$pid" 2>/dev/null || true
-    rm -f "$STATE/hold.pid" "$STATE/token"
+    rm -f "$STATE/hold.pid" "$STATE/hold.invocation" "$STATE/token"
 }
 
 run_app() {

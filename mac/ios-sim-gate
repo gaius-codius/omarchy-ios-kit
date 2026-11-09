@@ -93,12 +93,18 @@ check_key() {
 }
 
 take() {
-    # A hold whose process is gone is stale: renamed away (only one taker wins the
-    # rename), then removed.
-    # A hold just made has no pid yet: it is stale only once it is a minute old.
-    if [ -d "$LOCK" ] && ! holder_alive && { [ -f "$LOCK/pid" ] || [ -n "$(find "$LOCK" -maxdepth 0 -mmin +1)" ]; }; then
-        if mv "$LOCK" "$LOCK.stale.$$" 2>/dev/null; then rm -rf "$LOCK.stale.$$"; fi
+    # A hold whose process is gone is stale. Breaking one is serialised by a second lock,
+    # .break, so two takers can't both break it and one of them remove the other's fresh
+    # hold; the one that gets .break checks again before it breaks the hold.
+    if [ -d "$LOCK" ] && ! holder_alive && mkdir "$ROOT/.break" 2>/dev/null; then
+        # A hold just made has no pid yet: it is stale only once it is a minute old.
+        if [ -d "$LOCK" ] && ! holder_alive && { [ -f "$LOCK/pid" ] || [ -n "$(find "$LOCK" -maxdepth 0 -mmin +1)" ]; }; then
+            rm -rf "$LOCK"
+        fi
+        rmdir "$ROOT/.break"
     fi
+    # A .break left by a gate that died while breaking is removed once a minute old.
+    if [ -d "$ROOT/.break" ] && [ -n "$(find "$ROOT/.break" -maxdepth 0 -mmin +1)" ]; then rmdir "$ROOT/.break" 2>/dev/null || true; fi
     if ! mkdir "$LOCK" 2>/dev/null; then
         echo "busy: the runs' simulator is held by $(cat "$LOCK/who" 2>/dev/null || echo someone) since $(cat "$LOCK/since" 2>/dev/null || echo "a moment ago")"
         exit $EX_BUSY

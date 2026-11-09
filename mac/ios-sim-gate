@@ -1,0 +1,292 @@
+#!/bin/bash
+# The forced command of the runs' key on the Mac (authorized_keys `command=`): the only
+# thing a coding agent's run can do over that key. It drives one simulator of its own,
+# "csp runs", never another device, and one run holds it at a time.
+#
+# Verbs, as SSH_ORIGINAL_COMMAND (ios-sim-lane sends them; arguments come on stdin, one
+# per line, so nothing on the command line is parsed by a shell):
+#
+#   hold                 take the runs' simulator: reads a label (the first stdin line),
+#                        erases and boots the device, prints "token T" and "udid U",
+#                        then holds it until stdin closes (the run's ssh ends), and
+#                        erases it again. Exits 75 with "busy: ..." while another holds it.
+#   upload T KEY         a tar on stdin (src/ and deps/) into runs/KEY
+#   build T KEY          build runs/KEY/src for the simulator, install and launch it
+#   shot T               a PNG of the screen, on stdout
+#   axe T                AXe with the arguments on stdin, on the runs' device only
+#   sim T                xcrun simctl SUB <the runs' device> ARGS, for a few SUBs
+#   trust T              add the PEM certificate on stdin as a trusted root, on the runs'
+#                        device (the scratch csp's authority)
+#
+# T is the token hold printed: a verb without the holder's token is refused.
+#
+# Settings: IOS_SIM_GATE_DEVICE_TYPE (default "iPhone 18 Pro"), IOS_SIM_GATE_PATH (the
+# tools' folders, default Homebrew's), in ~/ios-sim-run/gate.conf.
+# Written for macOS's /bin/bash 3.2: no mapfile, no associative arrays.
+set -euo pipefail
+
+ROOT="$HOME/ios-sim-run/runs"
+CONF="$HOME/ios-sim-run/gate.conf"
+DEVICE_NAME="csp runs"
+IOS_SIM_GATE_DEVICE_TYPE="iPhone 18 Pro"
+IOS_SIM_GATE_PATH="/opt/homebrew/bin:/usr/local/bin"
+# shellcheck source=/dev/null
+[ -f "$CONF" ] && . "$CONF"
+PATH="$IOS_SIM_GATE_PATH:$PATH"
+LOCK="$ROOT/.lock"
+EX_BUSY=75
+
+die() { echo "ios-sim-gate: $*" >&2; exit 2; }
+
+mkdir -p "$ROOT"
+
+# The words of the command line; a word may hold letters, digits and ._- only.
+cmd=${SSH_ORIGINAL_COMMAND:-}
+case $cmd in *[!A-Za-z0-9._\ -]*) die "refused: only letters, digits and ._- on the command line" ;; esac
+# shellcheck disable=SC2206 # the words are checked above; splitting is meant
+words=($cmd)
+verb=${words[0]:-}
+
+# args reads stdin into the array ARGS, one argument per line.
+ARGS=()
+read_args() {
+    local line
+    while IFS= read -r line || [ -n "$line" ]; do ARGS+=("$line"); done
+}
+
+# udid is the runs' device's id, made when there is none.
+udid() {
+    local u
+    u=$(xcrun simctl list devices available | sed -n "s/^ *$DEVICE_NAME (\([0-9A-Fa-f-]\{36\}\)).*/\1/p" | head -1)
+    if [ -z "$u" ]; then
+        u=$(xcrun simctl create "$DEVICE_NAME" "$IOS_SIM_GATE_DEVICE_TYPE")
+    fi
+    [ -n "$u" ] || die "can't find or make the simulator \"$DEVICE_NAME\""
+    echo "$u"
+}
+
+# wipe shuts the runs' device down and erases it: its keychain (a pairing), its apps and
+# their data go.
+wipe() {
+    xcrun simctl shutdown "$1" >/dev/null 2>&1 || true
+    xcrun simctl erase "$1"
+}
+
+# check_token refuses a verb without the holder's token.
+check_token() {
+    local tok=${1:-}
+    [ -n "$tok" ] && [ -f "$LOCK/token" ] && [ "$tok" = "$(cat "$LOCK/token")" ] ||
+        die "refused: the runs' simulator isn't held with that token (ios-sim-lane take first)"
+    holder_alive || die "refused: the hold has ended"
+}
+
+# boot_id names this boot of the Mac: a pid from an earlier boot is someone else's now.
+boot_id() { sysctl -n kern.boottime 2>/dev/null || cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown; }
+
+holder_alive() {
+    local pid
+    pid=$(cat "$LOCK/pid" 2>/dev/null) || return 1
+    [ "$(cat "$LOCK/boot" 2>/dev/null)" = "$(boot_id)" ] && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+check_key() {
+    case ${1:-} in
+        "" | .* | *[!A-Za-z0-9._-]*) die "refused: a key is letters, digits and ._-, not starting with a dot" ;;
+    esac
+}
+
+take() {
+    # A hold whose process is gone is stale. Breaking one is serialised by a second lock,
+    # .break, so two takers can't both break it and one of them remove the other's fresh
+    # hold; the one that gets .break checks again before it breaks the hold.
+    if [ -d "$LOCK" ] && ! holder_alive && mkdir "$ROOT/.break" 2>/dev/null; then
+        # A hold just made has no pid yet: it is stale only once it is a minute old.
+        if [ -d "$LOCK" ] && ! holder_alive && { [ -f "$LOCK/pid" ] || [ -n "$(find "$LOCK" -maxdepth 0 -mmin +1)" ]; }; then
+            rm -rf "$LOCK"
+        fi
+        rmdir "$ROOT/.break"
+    fi
+    # A .break left by a gate that died while breaking is removed once a minute old.
+    if [ -d "$ROOT/.break" ] && [ -n "$(find "$ROOT/.break" -maxdepth 0 -mmin +1)" ]; then rmdir "$ROOT/.break" 2>/dev/null || true; fi
+    if ! mkdir "$LOCK" 2>/dev/null; then
+        echo "busy: the runs' simulator is held by $(cat "$LOCK/who" 2>/dev/null || echo someone) since $(cat "$LOCK/since" 2>/dev/null || echo "a moment ago")"
+        exit $EX_BUSY
+    fi
+    boot_id >"$LOCK/boot"
+    echo $$ >"$LOCK/pid"
+}
+
+release() {
+    local u=$1
+    wipe "$u" >/dev/null 2>&1 || true
+    rm -rf "$LOCK"
+}
+
+# HOLD_UDID is global: the EXIT trap runs after hold has returned, when its locals are gone.
+HOLD_UDID=""
+hold() {
+    local label tok
+    IFS= read -r label || true
+    case $label in "" | *[!A-Za-z0-9._\ -]*) label="a run" ;; esac
+    take
+    trap 'rm -rf "$LOCK"' EXIT
+    printf '%s\n' "$label" >"$LOCK/who"
+    date -u +%Y-%m-%dT%H:%M:%SZ >"$LOCK/since"
+    HOLD_UDID=$(udid)
+    trap 'release "$HOLD_UDID"' EXIT
+    local u=$HOLD_UDID
+    trap 'exit 0' HUP INT TERM PIPE
+    wipe "$u" >/dev/null
+    xcrun simctl boot "$u" >/dev/null 2>&1 || true
+    xcrun simctl bootstatus "$u" -b >/dev/null
+    tok=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+    printf '%s\n' "$tok" >"$LOCK/token"
+    echo "token $tok"
+    echo "udid $u"
+    # Held until the run's ssh ends: its stdin closes.
+    while IFS= read -r _; do :; done
+}
+
+upload() {
+    local key=$1 dir
+    check_key "$key"
+    dir="$ROOT/$key"
+    # One app's build is kept on the Mac at a time: the other keys' folders (their
+    # DerivedData is gigabytes) go.
+    find "$ROOT" -mindepth 1 -maxdepth 1 -type d ! -name '.*' ! -name "$key" -exec rm -rf {} +
+    rm -rf "$dir/src" "$dir/deps"
+    mkdir -p "$dir"
+    # bsdtar refuses absolute paths and .. by default.
+    tar -x -f - -C "$dir"
+    [ -f "$dir/src/Package.swift" ] || die "the upload has no src/Package.swift"
+    echo "uploaded $key"
+}
+
+build() {
+    local key=$1 u dir product bundle_id app products log
+    check_key "$key"
+    u=$(udid)
+    dir="$ROOT/$key"
+    [ -f "$dir/src/xtool.yml" ] && [ -f "$dir/src/Package.swift" ] || die "nothing uploaded for $key"
+    bundle_id=$(sed -n 's/^bundleID: *//p' "$dir/src/xtool.yml")
+    product=$(grep -A1 '\.library(' "$dir/src/Package.swift" | sed -n 's/.*name: *"\([^"]*\)".*/\1/p' | head -1)
+    case $bundle_id in "" | *[!A-Za-z0-9.-]*) die "can't read a bundle id from xtool.yml" ;; esac
+    case $product in "" | *[!A-Za-z0-9_]*) die "can't read the library product from Package.swift" ;; esac
+    mkdir -p "$dir/wrap/Sources/App"
+    : >"$dir/wrap/Sources/App/stub.c"
+    cat >"$dir/wrap/Package.swift" <<EOF
+// swift-tools-version: 6.0
+import PackageDescription
+let package = Package(
+    name: "SimRun",
+    platforms: [.iOS("26.0")],
+    dependencies: [.package(name: "RootPackage", path: "../src")],
+    targets: [
+        .executableTarget(
+            name: "App",
+            dependencies: [.product(name: "$product", package: "RootPackage")],
+            linkerSettings: [.unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/Frameworks"])]
+        )
+    ]
+)
+EOF
+    echo "building $key"
+    log="$dir/build.log"
+    if ! (cd "$dir/wrap" && xcodebuild -scheme SimRun -destination "generic/platform=iOS Simulator" \
+        -derivedDataPath ../dd -configuration Debug \
+        COMPILATION_CACHE_ENABLE_CACHING=NO COMPILATION_CACHE_CAS_PATH="$HOME/ios-sim-run/.cas" \
+        build >"$log" 2>&1); then
+        if grep -q "error:" "$log"; then grep "error:" "$log" | head -40 || true; else tail -40 "$log"; fi
+        die "build failed; the log is on the Mac: $log"
+    fi
+    products="$dir/dd/Build/Products/Debug-iphonesimulator"
+    app="$dir/out/$product.app"
+    rm -rf "$dir/out" && mkdir -p "$app"
+    cp "$products/App" "$app/$product"
+    for b in "$products"/*.bundle; do [ -e "$b" ] && cp -R "$b" "$app/"; done
+    if ls "$products/PackageFrameworks"/*.framework >/dev/null 2>&1; then
+        mkdir -p "$app/Frameworks" && cp -R "$products/PackageFrameworks"/*.framework "$app/Frameworks/"
+    fi
+    if [ -f "$dir/src/Info.plist" ]; then cp "$dir/src/Info.plist" "$app/Info.plist"; else plutil -create xml1 "$app/Info.plist"; fi
+    set_key() { plutil -replace "$1" "$2" "$3" "$app/Info.plist"; }
+    set_key CFBundleExecutable -string "$product"
+    set_key CFBundleIdentifier -string "$bundle_id"
+    set_key CFBundleName -string "$product"
+    set_key CFBundleDisplayName -string "$product"
+    set_key CFBundlePackageType -string APPL
+    set_key CFBundleShortVersionString -string 1.0.0
+    set_key CFBundleVersion -string 1
+    set_key CFBundleInfoDictionaryVersion -string 6.0
+    set_key MinimumOSVersion -string 26.0
+    set_key CFBundleSupportedPlatforms -json '["iPhoneSimulator"]'
+    set_key UIDeviceFamily -json '[1]'
+    plutil -extract UILaunchScreen raw "$app/Info.plist" >/dev/null 2>&1 || set_key UILaunchScreen -json '{}'
+    # Ad hoc and without the entitlements: with aps-environment the launch fails.
+    codesign -f -s - "$app" 2>/dev/null
+    xcrun simctl terminate "$u" "$bundle_id" 2>/dev/null || true
+    xcrun simctl install "$u" "$app"
+    xcrun simctl launch "$u" "$bundle_id" >/dev/null
+    echo "running $bundle_id on $DEVICE_NAME ($u)"
+}
+
+shot() {
+    local u f
+    u=$(udid)
+    f="$ROOT/.shot-$$.png"
+    xcrun simctl io "$u" screenshot "$f" >/dev/null 2>&1
+    cat "$f"
+    rm -f "$f"
+}
+
+axe_verb() {
+    local u a
+    u=$(udid)
+    read_args
+    [ ${#ARGS[@]} -gt 0 ] || die "axe needs arguments (tap, type, swipe, describe-ui, ...)"
+    for a in "${ARGS[@]}"; do
+        # "--" would make the gate's own --udid a plain argument.
+        case $a in --udid | --udid=* | --) die "refused: the gate names the device" ;; esac
+    done
+    axe "${ARGS[@]}" --udid "$u"
+}
+
+sim_verb() {
+    local u sub
+    u=$(udid)
+    read_args
+    sub=${ARGS[0]:-}
+    case $sub in
+        openurl | ui | privacy | status_bar | launch | terminate) ;;
+        *) die "refused: sim takes openurl, ui, privacy, status_bar, launch or terminate, not \"$sub\"" ;;
+    esac
+    if [ ${#ARGS[@]} -gt 1 ]; then
+        xcrun simctl "$sub" "$u" "${ARGS[@]:1}"
+    else
+        xcrun simctl "$sub" "$u"
+    fi
+}
+
+trust() {
+    local u f
+    u=$(udid)
+    f="$ROOT/.trust-$$.pem"
+    head -c 65536 >"$f"
+    grep -q -- '-----BEGIN CERTIFICATE-----' "$f" || { rm -f "$f"; die "trust takes one PEM certificate on stdin"; }
+    xcrun simctl keychain "$u" add-root-cert "$f"
+    rm -f "$f"
+    echo "trusted on $DEVICE_NAME"
+}
+
+case $verb in
+    hold) [ ${#words[@]} -eq 1 ] || die "usage: hold"; hold ;;
+    upload | build)
+        [ ${#words[@]} -eq 3 ] || die "usage: $verb TOKEN KEY"
+        check_token "${words[1]}"
+        "$verb" "${words[2]}" ;;
+    shot | axe | sim | trust)
+        [ ${#words[@]} -eq 2 ] || die "usage: $verb TOKEN"
+        check_token "${words[1]}"
+        case $verb in axe) axe_verb ;; sim) sim_verb ;; *) "$verb" ;; esac ;;
+    "") die "no verb: this key runs ios-sim-gate only (hold, upload, build, shot, axe, sim, trust)" ;;
+    *) die "refused: \"$verb\" (this key runs hold, upload, build, shot, axe, sim and trust only)" ;;
+esac

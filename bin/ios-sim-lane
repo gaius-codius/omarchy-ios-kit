@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+# Drive the runs' iOS Simulator on the Mac from a coding agent's run, through the runs' own
+# key, whose only command on the Mac is ios-sim-gate. One run holds the simulator at a
+# time; the device is erased when it is taken and when it is let go, so it never holds the
+# developer's pairing.
+#
+#   ios-sim-lane take [--label NAME] [--forward PORT]
+#                         take the simulator (exit 75 and "busy: ..." when another run
+#                         holds it: carry on without it). Forwards the Mac's
+#                         127.0.0.1:PORT (default 18443) to this machine's, where
+#                         `csp scratch` answers.
+#   ios-sim-lane run [APP DIR]   copy, build, install and open the app (default .)
+#   ios-sim-lane trust CA.pem    trust the scratch csp's authority on the simulator
+#   ios-sim-lane type TEXT       type TEXT one character at a time (AXe drops fast keys)
+#   ios-sim-lane axe ARGS...     AXe on the simulator (tap, swipe, describe-ui, ...)
+#   ios-sim-lane sim SUB ARGS... simctl SUB on the simulator (openurl, ui, privacy,
+#                                status_bar, launch, terminate)
+#   ios-sim-lane shot FILE       save a screenshot
+#   ios-sim-lane release         let the simulator go (also when the run's process ends)
+#   ios-sim-lane status          say whether this run holds it
+#
+# Settings (~/.config/ios-run/config or the environment):
+#   SIM_HOST                 the Mac, user@host (required)
+#   IOS_SIM_LANE_KEY         the runs' key (default ~/.config/ios-run/runs-key); never a
+#                            key in ~/.ssh
+#   IOS_SIM_LANE_KNOWN_HOSTS the Mac's host key (default ~/.config/ios-run/runs-known_hosts)
+#   IOS_SIM_LANE_DIR         this run's hold (default ios-sim-lane-<run> in $XDG_RUNTIME_DIR or
+#                            $TMPDIR, <run> being $CSP_RUN, else the unit's $INVOCATION_ID)
+# ssh reads no system or user ssh config: inside a run's unit those files belong to nobody,
+# and ssh refuses them.
+set -euo pipefail
+
+IOS_RUN_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/ios-run/config"
+# shellcheck source=/dev/null
+[ -f "$IOS_RUN_CONFIG" ] && . "$IOS_RUN_CONFIG"
+: "${SIM_HOST:?set SIM_HOST=user@host (the Mac) in $IOS_RUN_CONFIG}"
+KEY=${IOS_SIM_LANE_KEY:-${XDG_CONFIG_HOME:-$HOME/.config}/ios-run/runs-key}
+KNOWN=${IOS_SIM_LANE_KNOWN_HOSTS:-${XDG_CONFIG_HOME:-$HOME/.config}/ios-run/runs-known_hosts}
+# Each run has its own hold folder: runs share the runtime folder, and each has its own
+# process ids (PrivatePIDs), so one run's pid means nothing in another's.
+RUN_ID=${CSP_RUN:-${INVOCATION_ID:-$(id -u)}}
+RUN_ID=$(printf '%s' "$RUN_ID" | tr -c 'A-Za-z0-9._-' '_')
+STATE=${IOS_SIM_LANE_DIR:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/ios-sim-lane-$RUN_ID}
+# The unit's invocation: a pid recorded in an earlier turn's unit is another process now.
+INVOCATION=${INVOCATION_ID:-none}
+SSH=${IOS_SIM_LANE_SSH:-ssh}
+EX_BUSY=75
+
+die() { echo "ios-sim-lane: $*" >&2; exit "${2:-1}"; }
+
+case $(realpath -m "$KEY") in
+    "$(realpath -m "$HOME/.ssh")"/*) die "refused: $KEY is in ~/.ssh; runs use their own key" ;;
+esac
+[ -r "$KEY" ] || die "no runs' key at $KEY (the developer makes it: README, \"Runs and the simulator\")"
+[ -r "$KNOWN" ] || die "no known host key for the Mac at $KNOWN (README, \"Runs and the simulator\")"
+
+mkdir -p "$STATE" && chmod 700 "$STATE"
+CFG="$STATE/ssh_config"
+user=${SIM_HOST%@*} host=${SIM_HOST#*@}
+[ "$user" != "$SIM_HOST" ] || user=$(id -un)
+cat >"$CFG" <<EOF
+Host simmac
+  HostName $host
+  User $user
+  IdentityFile $KEY
+  IdentitiesOnly yes
+  IdentityAgent none
+  UserKnownHostsFile $KNOWN
+  GlobalKnownHostsFile /dev/null
+  StrictHostKeyChecking yes
+  BatchMode yes
+  ControlPath $STATE/cm
+  ServerAliveInterval 15
+  ConnectTimeout 20
+EOF
+
+# gate VERB [WORDS...]: run a gate verb on the Mac; stdin goes to it.
+gate() { "$SSH" -F "$CFG" simmac "$*"; }
+
+token() {
+    [ -s "$STATE/token" ] && holding || die "this run doesn't hold the simulator: ios-sim-lane take first"
+    cat "$STATE/token"
+}
+
+holding() {
+    local pid
+    pid=$(cat "$STATE/hold.pid" 2>/dev/null) || return 1
+    [ "$(cat "$STATE/hold.invocation" 2>/dev/null)" = "$INVOCATION" ] && kill -0 "$pid" 2>/dev/null
+}
+
+# args ARGS...: one per line on stdout, for a verb that reads its arguments on stdin.
+args() {
+    local a
+    for a in "$@"; do
+        case $a in *$'\n'*) die "an argument holds a new line" ;; esac
+        printf '%s\n' "$a"
+    done
+}
+
+# axe_call ARGS...: an AXe verb on the simulator. Just after the device is erased, AXe
+# can't open its automation session for a while ("Timed out creating the simulator
+# remote automation session"); that error alone is retried, for up to a minute.
+axe_call() {
+    local a i
+    a=$(args "$@") || exit 1
+    for ((i = 0; i < 12; i++)); do
+        if gate axe "$tok" <<<"$a" >"$STATE/axe.out" 2>"$STATE/axe.err"; then
+            cat "$STATE/axe.out"
+            return 0
+        fi
+        grep -q 'remote automation session' "$STATE/axe.err" || break
+        sleep "${IOS_SIM_LANE_AXE_WAIT:-5}"
+    done
+    cat "$STATE/axe.err" >&2
+    return 1
+}
+
+take() {
+    local label="a run" port=18443 waited=0 line
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --label) label=$2; shift 2 ;;
+            --forward) port=$2; shift 2 ;;
+            *) die "unknown option: $1" 2 ;;
+        esac
+    done
+    case $port in "" | *[!0-9]*) die "--forward takes a port" 2 ;; esac
+    if holding; then echo "this run holds the simulator already"; return 0; fi
+    rm -f "$STATE/hold.out" "$STATE/token" "$STATE/cm"
+    # The hold is the ssh, leading a process group of its own: release stops the group,
+    # and so does the end of the run's process. Its stdin stays open while it lives. The
+    # port is forwarded only once the gate has given the hold, so a busy simulator is told
+    # as busy, not as a port already taken.
+    setsid bash -c '
+        exec "$2" -F "$3" -o ControlMaster=yes simmac hold < <(printf "%s\n" "$1"; exec sleep 2147483647)
+    ' _ "$label" "$SSH" "$CFG" >"$STATE/hold.out" 2>"$STATE/hold.err" </dev/null &
+    echo $! >"$STATE/hold.pid"
+    printf '%s\n' "$INVOCATION" >"$STATE/hold.invocation"
+    while :; do
+        if line=$(grep -m1 '^token ' "$STATE/hold.out" 2>/dev/null); then
+            printf '%s\n' "${line#token }" >"$STATE/token"
+            if ! "$SSH" -F "$CFG" -O forward -R "127.0.0.1:$port:127.0.0.1:$port" simmac 2>"$STATE/forward.err"; then
+                release_quiet
+                die "the Mac's 127.0.0.1:$port couldn't be forwarded back: $(tr '\n' ' ' <"$STATE/forward.err")"
+            fi
+            echo "holding the runs' simulator ($(sed -n 's/^udid //p' "$STATE/hold.out")); the Mac's 127.0.0.1:$port reaches this machine's"
+            return 0
+        fi
+        if line=$(grep -m1 '^busy: ' "$STATE/hold.out" 2>/dev/null); then
+            release_quiet
+            echo "$line; carry on without the simulator" >&2
+            exit $EX_BUSY
+        fi
+        if ! holding; then
+            release_quiet
+            die "the hold ended: $(tr '\n' ' ' <"$STATE/hold.err" 2>/dev/null)"
+        fi
+        if [ $waited -ge 240 ]; then
+            release_quiet
+            die "the simulator wasn't ready in 2 minutes"
+        fi
+        sleep 0.5
+        waited=$((waited + 1))
+    done
+}
+
+release_quiet() {
+    local pid
+    pid=$(cat "$STATE/hold.pid" 2>/dev/null) || pid=""
+    # The hold's process group, by its leader's id.
+    [ -n "$pid" ] && kill -- "-$pid" 2>/dev/null || true
+    rm -f "$STATE/hold.pid" "$STATE/hold.invocation" "$STATE/token"
+}
+
+run_app() {
+    local app_dir=${1:-.} key stage d name
+    app_dir=$(cd "$app_dir" && pwd)
+    [ -f "$app_dir/xtool.yml" ] && [ -f "$app_dir/Package.swift" ] || die "not an xtool app: $app_dir"
+    key=$(basename "$app_dir" | tr -c 'A-Za-z0-9._\n-' '-')
+    key=${key#.}
+    stage="$STATE/stage"
+    rm -rf "$stage" && mkdir -p "$stage/src" "$stage/deps"
+    # The app as it is in the run's checkout: no file from another checkout is added.
+    tar -C "$app_dir" --exclude=./.build --exclude=./.git --exclude=./xtool --exclude=./.bsp --exclude=./shots -cf - . |
+        tar -C "$stage/src" -xf -
+    # Local path dependencies (the HotReload package) go beside it, made relative.
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        name=$(basename "$d")
+        mkdir -p "$stage/deps/$name"
+        tar -C "$d" --exclude=./.build -cf - . | tar -C "$stage/deps/$name" -xf -
+        sed -i "s#\"$d\"#\"../deps/$name\"#" "$stage/src/Package.swift"
+    done < <(sed -n 's/.*\.package(path: *"\(\/[^"]*\)").*/\1/p' "$app_dir/Package.swift")
+    echo "copying $key"
+    tar -C "$stage" -cf - src deps | gate upload "$tok" "$key"
+    gate build "$tok" "$key" </dev/null
+}
+
+cmd=${1:-}
+[ $# -gt 0 ] && shift
+# The token, read before any verb is sent: a run that doesn't hold the simulator stops here.
+case $cmd in run | trust | shot | axe | type | sim) tok=$(token) ;; esac
+case $cmd in
+    take) take "$@" ;;
+    run) run_app "$@" ;;
+    trust) [ $# -eq 1 ] || die "usage: ios-sim-lane trust CA.pem" 2; gate trust "$tok" <"$1" ;;
+    shot)
+        [ $# -eq 1 ] || die "usage: ios-sim-lane shot FILE" 2
+        gate shot "$tok" </dev/null >"$1.part" && mv "$1.part" "$1" && echo "$1" ;;
+    axe) axe_call "$@" ;;
+    type)
+        [ $# -eq 1 ] || die "usage: ios-sim-lane type TEXT" 2
+        for ((i = 0; i < ${#1}; i++)); do
+            axe_call type "${1:i:1}" >/dev/null
+            sleep 0.15
+        done ;;
+    sim) args "$@" | gate sim "$tok" ;;
+    release) release_quiet; echo "let the runs' simulator go" ;;
+    status) if holding; then echo "this run holds the runs' simulator"; else echo "this run doesn't hold the simulator"; fi ;;
+    -h | --help | "") sed -n 2,28p "$0"; [ -n "$cmd" ] ;;
+    *) die "unknown command: $cmd (see --help)" 2 ;;
+esac

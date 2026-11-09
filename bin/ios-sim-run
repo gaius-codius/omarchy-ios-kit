@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+# Run the xtool project in the current folder in the iOS Simulator on a Mac, over ssh.
+# The Mac builds it with Xcode; nothing is signed with your identity.
+#
+#   ios-sim-run [app dir] [--device NAME] [--shot FILE] [--release]
+#                                  copy, build, install and open the app (default device
+#                                  "iPhone 18 Pro"); --shot saves a screenshot here
+#   ios-sim-run shot FILE          screenshot the running simulator
+#   ios-sim-run axe ARGS...        run AXe on the Mac against that simulator (tap, type,
+#                                  swipe, describe-ui, ...); --udid is added for you
+#   ios-sim-run sim ARGS...        run `xcrun simctl ARGS` on the Mac (push, ui, privacy, ...);
+#                                  the word `booted` targets the simulator
+#
+# Settings (~/.config/ios-run/config or the environment):
+#   SIM_HOST    the Mac, as user@host (required). It needs Xcode; `axe` needs AXe
+#               (brew install cameroncooke/axe/axe).
+#   SIM_DEVICE  the default simulator name.
+#
+# On the Mac each app dir gets ~/ios-sim-run/<dir name>/: the copied source, a wrapper
+# package, derived data and the .app. A git worktree also gets the git-ignored files under
+# Sources/ (an address file, say) from its main checkout, unless it has its own.
+set -euo pipefail
+
+IOS_RUN_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/ios-run/config"
+# shellcheck source=/dev/null
+[ -f "$IOS_RUN_CONFIG" ] && . "$IOS_RUN_CONFIG"
+: "${SIM_HOST:?set SIM_HOST=user@host (the Mac) in $IOS_RUN_CONFIG}"
+PATH_MAC='export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH'
+
+udid_of_last() {
+    ssh "$SIM_HOST" "cat ~/ios-sim-run/.last-udid 2>/dev/null" || true
+}
+
+case ${1:-} in
+    shot)
+        [[ -n ${2:-} ]] || { echo "usage: ios-sim-run shot FILE" >&2; exit 2; }
+        u=$(udid_of_last); [[ -n $u ]] || { echo "no simulator run yet" >&2; exit 1; }
+        ssh "$SIM_HOST" "xcrun simctl io $u screenshot /tmp/ios-sim-run-shot.png >/dev/null 2>&1"
+        scp -q "$SIM_HOST:/tmp/ios-sim-run-shot.png" "$2"
+        echo "$2"
+        exit 0 ;;
+    axe)
+        shift
+        u=$(udid_of_last); [[ -n $u ]] || { echo "no simulator run yet" >&2; exit 1; }
+        ssh "$SIM_HOST" "$PATH_MAC; axe $(printf '%q ' "$@") --udid $u"
+        exit $? ;;
+    sim)
+        shift
+        u=$(udid_of_last); [[ -n $u ]] || { echo "no simulator run yet" >&2; exit 1; }
+        args=()
+        for a in "$@"; do [[ $a == booted ]] && args+=("$u") || args+=("$a"); done
+        ssh "$SIM_HOST" "xcrun simctl $(printf '%q ' "${args[@]}")"
+        exit $? ;;
+    -h|--help)
+        sed -n 2,22p "$0"; exit 0 ;;
+esac
+
+app_dir=.
+device=${SIM_DEVICE:-iPhone 18 Pro}
+shot=""
+config=Debug
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --device) device=$2; shift 2 ;;
+        --shot) shot=$2; shift 2 ;;
+        --release) config=Release; shift ;;
+        -*) echo "unknown option: $1 (see --help)" >&2; exit 2 ;;
+        *) app_dir=$1; shift ;;
+    esac
+done
+
+app_dir=$(cd "$app_dir" && pwd)
+[[ -f $app_dir/xtool.yml && -f $app_dir/Package.swift ]] || { echo "not an xtool app: $app_dir" >&2; exit 1; }
+
+key=$(basename "$app_dir")
+bundle_id=$(sed -n 's/^bundleID: *//p' "$app_dir/xtool.yml")
+# The app is the package's one library product (xtool's rule).
+product=$(grep -A1 '\.library(' "$app_dir/Package.swift" | sed -n 's/.*name: *"\([^"]*\)".*/\1/p' | head -1)
+[[ -n $bundle_id && -n $product ]] || { echo "can't read bundleID (xtool.yml) or the library product (Package.swift)" >&2; exit 1; }
+
+# Local path dependencies (the HotReload package) are copied next to the source and made relative.
+mapfile -t deps < <(sed -n 's/.*\.package(path: *"\(\/[^"]*\)").*/\1/p' "$app_dir/Package.swift")
+
+remote=ios-sim-run/$key
+ssh "$SIM_HOST" "mkdir -p $remote/src $remote/deps"
+echo "copying $key to $SIM_HOST"
+rsync -a --delete --exclude .build --exclude .git --exclude xtool --exclude .bsp --exclude shots \
+    "$app_dir/" "$SIM_HOST:$remote/src/"
+
+# A worktree lacks the main checkout's git-ignored files under Sources/; copy those it doesn't have.
+main=$(git -C "$app_dir" worktree list --porcelain 2>/dev/null | sed -n '1s/^worktree //p' || true)
+if [[ -n $main && $main != "$app_dir" ]]; then
+    while IFS= read -r f; do
+        [[ -e $app_dir/$f ]] && continue
+        rsync -a --relative "$main/./$f" "$SIM_HOST:$remote/src/"
+        echo "  from the main checkout: $f"
+    done < <(git -C "$main" ls-files --others --ignored --exclude-standard Sources)
+fi
+
+dep_pairs=()
+for d in "${deps[@]}"; do
+    name=$(basename "$d")
+    rsync -a --delete --exclude .build "$d/" "$SIM_HOST:$remote/deps/$name/"
+    dep_pairs+=("$d" "$name")
+done
+
+# ssh joins its arguments into one shell line, so each is quoted for the Mac's shell.
+remote_args=$(printf '%q ' "$remote" "$product" "$bundle_id" "$device" "$config" "${dep_pairs[@]}")
+ssh "$SIM_HOST" "bash -s -- $remote_args" <<'MAC'
+set -euo pipefail
+remote=$1 product=$2 bundle_id=$3 device=$4 config=$5
+shift 5
+cd ~/"$remote"
+while [[ $# -ge 2 ]]; do
+    sed -i '' "s#\"$1\"#\"../deps/$2\"#" src/Package.swift
+    shift 2
+done
+
+mkdir -p wrap/Sources/App
+: > wrap/Sources/App/stub.c
+cat > wrap/Package.swift <<EOF
+// swift-tools-version: 6.0
+import PackageDescription
+let package = Package(
+    name: "SimRun",
+    platforms: [.iOS("26.0")],
+    dependencies: [.package(name: "RootPackage", path: "../src")],
+    targets: [
+        .executableTarget(
+            name: "App",
+            dependencies: [.product(name: "$product", package: "RootPackage")],
+            linkerSettings: [.unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/Frameworks"])]
+        )
+    ]
+)
+EOF
+
+# The compilation cache gets its own path: Xcode's preference for it may name a drive
+# that isn't mounted, which fails the build.
+echo "building ($config)"
+log=$(mktemp)
+if ! (cd wrap && xcodebuild -scheme SimRun -destination "generic/platform=iOS Simulator" \
+        -derivedDataPath ../dd -configuration "$config" \
+        COMPILATION_CACHE_ENABLE_CACHING=NO COMPILATION_CACHE_CAS_PATH="$HOME/ios-sim-run/.cas" \
+        build >"$log" 2>&1); then
+    grep -E "error:" "$log" | head -40 || tail -40 "$log"
+    echo "build failed; the full log is on the Mac: $log" >&2
+    exit 1
+fi
+
+products=dd/Build/Products/$config-iphonesimulator
+app=out/$product.app
+rm -rf out && mkdir -p "$app"
+cp "$products/App" "$app/$product"
+for b in "$products"/*.bundle; do [[ -e $b ]] && cp -R "$b" "$app/"; done
+if ls "$products/PackageFrameworks"/*.framework >/dev/null 2>&1; then
+    mkdir -p "$app/Frameworks" && cp -R "$products/PackageFrameworks"/*.framework "$app/Frameworks/"
+fi
+
+# The keys xtool adds to the app's own Info.plist.
+if [[ -f src/Info.plist ]]; then cp src/Info.plist "$app/Info.plist"; else plutil -create xml1 "$app/Info.plist"; fi
+set_key() { plutil -replace "$1" "$2" "$3" "$app/Info.plist"; }
+set_key CFBundleExecutable -string "$product"
+set_key CFBundleIdentifier -string "$bundle_id"
+set_key CFBundleName -string "$product"
+set_key CFBundleDisplayName -string "$product"
+set_key CFBundlePackageType -string APPL
+set_key CFBundleShortVersionString -string 1.0.0
+set_key CFBundleVersion -string 1
+set_key CFBundleInfoDictionaryVersion -string 6.0
+set_key MinimumOSVersion -string 26.0
+set_key CFBundleSupportedPlatforms -json '["iPhoneSimulator"]'
+set_key UIDeviceFamily -json '[1]'
+plutil -extract UILaunchScreen raw "$app/Info.plist" >/dev/null 2>&1 || set_key UILaunchScreen -json '{}'
+
+# Ad hoc and without the entitlements: signed in, aps-environment fails the launch (OS_REASON_EXEC).
+codesign -f -s - "$app" 2>/dev/null
+
+udid=$(xcrun simctl list devices available -j | python3 -c '
+import json, sys
+name = sys.argv[1]
+for runtime, devs in json.load(sys.stdin)["devices"].items():
+    for d in devs:
+        if d["name"] == name and "iOS" in runtime:
+            print(d["udid"]); sys.exit()
+' "$device")
+[[ -n $udid ]] || { echo "no simulator named \"$device\" (xcrun simctl list devices available)" >&2; exit 1; }
+xcrun simctl boot "$udid" 2>/dev/null || true
+xcrun simctl bootstatus "$udid" -b >/dev/null
+open -a Simulator --args -CurrentDeviceUDID "$udid" 2>/dev/null || true
+xcrun simctl terminate "$udid" "$bundle_id" 2>/dev/null || true
+xcrun simctl install "$udid" "$app"
+xcrun simctl launch "$udid" "$bundle_id" >/dev/null
+echo "$udid" > ~/ios-sim-run/.last-udid
+echo "running $bundle_id on $device ($udid)"
+MAC
+
+if [[ -n $shot ]]; then
+    sleep 3
+    exec "$0" shot "$shot"
+fi

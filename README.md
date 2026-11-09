@@ -38,7 +38,7 @@ you don't have to find them again.
 9. [Coding agents (AGENTS.md)](#9-coding-agents-agentsmd)
 10. [Keeping it working](#10-keeping-it-working)
 11. [Troubleshooting](#11-troubleshooting)
-12. [Intel Macs and other machines](#12-intel-macs-and-other-machines)
+12. [Intel Macs, other machines and the Simulator](#12-intel-macs-and-other-machines)
 13. [Uninstall](#13-uninstall)
 14. [Credits and license](#14-credits-and-license)
 
@@ -521,6 +521,122 @@ different is hardware, and **untested by us**:
 If you try it on another machine, the quickest end-to-end check is:
 `new-ios-app Check`, F6 (runs), F5 (stops at a breakpoint), then edit a
 `Text` and save (hot reload).
+
+### 12.1 The iOS Simulator on a Mac (`ios-sim-run`)
+
+Linux has no Simulator, but a Mac with Xcode on your network (Tailscale works) can run
+your app in one, driven from here over ssh. Use it to check a branch without the phone. Coding
+agents can use it too: they can tap, type and take screenshots on their own.
+
+Once:
+1. On the Mac: Xcode with an iOS Simulator runtime, ssh login from this machine, and
+   [AXe](https://github.com/cameroncooke/AXe) for taps: `brew install cameroncooke/axe/axe`.
+2. Here: add `SIM_HOST="user@mac"` to `~/.config/ios-run/config` (and `SIM_DEVICE` to change
+   the default simulator, "iPhone 18 Pro").
+
+Daily, in the app folder or a worktree of it:
+
+| Do | Command |
+|---|---|
+| Copy, build, install and open the app | `ios-sim-run` (`--device "iPhone 17"`, `--release`) |
+| The same, plus a screenshot | `ios-sim-run --shot shot.png` |
+| Screenshot what's on screen now | `ios-sim-run shot shot.png` |
+| Tap, type, read the screen | `ios-sim-run axe tap --label Settings`, `ios-sim-run axe type abc`, `ios-sim-run axe describe-ui` |
+| Anything `simctl` does | `ios-sim-run sim ui booted appearance dark`, `ios-sim-run sim push booted <bundle id> push.json` |
+
+How it works: the app folder is copied to `~/ios-sim-run/<folder>/` on the Mac, with its local
+path packages (HotReload) beside it. A wrapper package, like xtool's, makes the app library an
+executable. `xcodebuild` builds it for the Simulator, and the script wraps it in an `.app` with
+xtool's Info.plist keys. A worktree also gets the git-ignored files under `Sources/` from
+its main checkout, unless it has its own. A build takes about 15 to 30 seconds.
+
+Known traps:
+- **The app is signed ad hoc without its entitlements.** Signed with them, `aps-environment`
+  fails the launch (`OS_REASON_EXEC`). Push registration and other features that need an
+  entitlement don't work in the Simulator for now.
+- **Xcode's compilation cache preference can name a drive that isn't mounted.** That fails the
+  build ("You don't have permission to save the file…"). The script gives the cache its own path.
+- **AXe can drop characters typed fast** into fields that move focus as you type (a code
+  entered box by box). Type one character at a time with a short pause.
+- **Homebrew isn't on a non-interactive ssh PATH** on a Mac. The script adds `/opt/homebrew/bin`.
+- **Hot reload doesn't work here.** Run `ios-sim-run` again after each change.
+
+### 12.2 Runs and the simulator (`ios-sim-lane`)
+
+A coding agent's unattended run can drive a simulator too, with `ios-sim-lane` in place of
+`ios-sim-run`. It is built so that a run can't act as you:
+
+- **Its own key.** The run logs in with a key made for runs alone. On the Mac, that key's only
+  command is `ios-sim-gate`, which takes a short list of verbs and no shell. Your own key in
+  `~/.ssh` is refused, and a run's sandbox can't read that folder anyway.
+- **Its own simulator.** The gate drives one device, "csp runs", and never another, so your
+  simulators and their pairings stay out of reach. The device is erased when a run takes it
+  and when the run lets it go, so no pairing survives from one holder to the next.
+- **One run at a time.** A second run is told `busy: ... held by <run> since <time>`, exits 75
+  and carries on without the simulator. The hold ends when the run lets it go or when its
+  process ends, because its ssh connection then closes. A hold whose process is gone, after a
+  reboot say, is taken over.
+- **No system files.** `ios-sim-lane` writes its own ssh config and reads no system or user
+  config. Inside a run's sandbox, `/etc/ssh` belongs to nobody, and ssh refuses it.
+- **The app talks to a scratch server.** The run forwards the Mac's `127.0.0.1:18443` to its
+  own machine, where a scratch server answers. For conspector that is `csp scratch`, with
+  synthetic items, so the app is never paired with the real `csp`.
+
+Once, by you (an agent never makes or handles the key):
+
+1. Install the kit again (`./install.sh`), so `ios-sim-lane` is on your PATH.
+2. Make the runs' key, without a passphrase, since a run can't type one:
+   `ssh-keygen -t ed25519 -N '' -C runs-simulator -f ~/.config/ios-run/runs-key`.
+3. Pin the Mac's host key for runs. Your own `known_hosts` is out of their reach.
+   `ssh-keygen -F <mac>` prints the line you already trust; save it with
+   `ssh-keygen -F <mac> | grep -v '^#' > ~/.config/ios-run/runs-known_hosts`.
+4. Install the gate on the Mac: `scp mac/ios-sim-gate <user>@<mac>:ios-sim-run/ios-sim-gate`, then
+   `ssh <user>@<mac> chmod 755 ios-sim-run/ios-sim-gate`.
+5. On the Mac, add one line to `~/.ssh/authorized_keys`, with your Mac user's home and the
+   contents of `~/.config/ios-run/runs-key.pub`:
+
+   ```
+   restrict,port-forwarding,permitlisten="127.0.0.1:18443",permitopen="127.0.0.1:9",command="/Users/<user>/ios-sim-run/ios-sim-gate" ssh-ed25519 AAAA... runs-simulator
+   ```
+
+   `restrict` turns off agent and X11 forwarding and a terminal, and the forced command
+   replaces the shell. `port-forwarding` lets the run forward back to its own machine on that
+   one port; `permitopen` names a port nothing listens on, so `-L` reaches nothing. It also
+   turns Unix socket forwarding back on, which these options don't narrow.
+
+   What this guards against is a run's mistake: acting on your simulator, keeping a pairing,
+   using your key. It is not a wall against a run that sets out to break out. The run's own
+   branch is built and launched on the Mac as your Mac user, and a Swift package can run code
+   while it builds.
+6. Check it: `ios-sim-lane take --label check && ios-sim-lane release`.
+
+Settings for the gate go in `~/ios-sim-run/gate.conf` on the Mac (`IOS_SIM_GATE_DEVICE_TYPE`,
+default "iPhone 18 Pro"). The gate reads nothing from the run's environment.
+
+A run, in the app folder or a worktree of it:
+
+| Do | Command |
+|---|---|
+| Take the simulator (exit 75: busy, carry on without it) | `ios-sim-lane take --label <run>` |
+| Copy, build, install and open the app | `ios-sim-lane run` |
+| Trust the scratch server's certificate | `ios-sim-lane trust <ca.pem>` |
+| Type into a field, one character at a time | `ios-sim-lane type K7Q2M9XD` |
+| Tap, swipe, read the screen | `ios-sim-lane axe tap --label "Needs you"`, `ios-sim-lane axe describe-ui` |
+| Open a link, set the look | `ios-sim-lane sim openurl <url>`, `ios-sim-lane sim ui appearance dark` |
+| Screenshot | `ios-sim-lane shot shot.png` |
+| Let it go | `ios-sim-lane release` |
+
+Traps:
+- **Type one character at a time.** AXe drops characters typed fast into a field that moves
+  focus as you type. `ios-sim-lane type` does this for you.
+- **Uninstalling the app doesn't clear its keychain items.** A pairing outlives a reinstall.
+  The gate erases the whole device instead, when a run takes it and when it lets it go.
+- **`simctl pbcopy` gets an empty stdin over ssh.** Type the text instead of pasting it.
+- **Nothing is copied from your main checkout.** `ios-sim-run` fills in a worktree's
+  git-ignored files under `Sources/` from the main checkout, which could build your real
+  server's address into the app. `ios-sim-lane` builds the run's checkout as it is.
+- **Release before the turn ends.** A hold lasts as long as the run's process. When the
+  process ends, the hold ends with it.
 
 ---
 
